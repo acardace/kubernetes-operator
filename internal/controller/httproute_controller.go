@@ -52,7 +52,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	for _, parent := range hr.Spec.ParentRefs {
-		gw, err := gatewayutil.GetParentGateway(ctx, r.Client, parent, hr.Namespace, GatewayControllerName)
+		gw, gwc, err := gatewayutil.GetParentGateway(ctx, r.Client, parent, hr.Namespace, GatewayControllerName)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -109,6 +109,12 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			if err != nil {
 				return ctrl.Result{}, err
 			}
+		}
+
+		// Private gateways expose backends as mesh-only network resources
+		// and do not register a public reverse proxy service.
+		if gwc.Name == GatewayClassNamePrivate {
+			continue
 		}
 
 		targets := []api.ServiceTarget{}
@@ -179,18 +185,10 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 func (r *HTTPRouteReconciler) reconcileDelete(ctx context.Context, sp *patch.SerialPatcher, hr *gwv1.HTTPRoute) (ctrl.Result, error) {
-	// Index all proxy services.
-	proxyServices, err := r.Netbird.ReverseProxyServices.List(ctx)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	proxyIdx := map[string]string{}
-	for _, proxyService := range proxyServices {
-		proxyIdx[proxyService.Domain] = proxyService.Id
-	}
+	var proxyIdx map[string]string
 
 	for _, parent := range hr.Spec.ParentRefs {
-		gw, err := gatewayutil.GetParentGateway(ctx, r.Client, parent, hr.Namespace, GatewayControllerName)
+		gw, gwc, err := gatewayutil.GetParentGateway(ctx, r.Client, parent, hr.Namespace, GatewayControllerName)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -244,6 +242,22 @@ func (r *HTTPRouteReconciler) reconcileDelete(ctx context.Context, sp *patch.Ser
 			}
 		}
 
+		// Private gateways do not create reverse proxy services.
+		if gwc.Name == GatewayClassNamePrivate {
+			continue
+		}
+
+		if proxyIdx == nil {
+			proxyServices, err := r.Netbird.ReverseProxyServices.List(ctx)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			proxyIdx = make(map[string]string, len(proxyServices))
+			for _, proxyService := range proxyServices {
+				proxyIdx[proxyService.Domain] = proxyService.Id
+			}
+		}
+
 		// Remove the target from the proxy service.
 		for _, hostname := range hr.Spec.Hostnames {
 			id, ok := proxyIdx[string(hostname)]
@@ -258,7 +272,7 @@ func (r *HTTPRouteReconciler) reconcileDelete(ctx context.Context, sp *patch.Ser
 	}
 
 	controllerutil.RemoveFinalizer(hr, k8sutil.Finalizer("httproute"))
-	err = sp.Patch(ctx, hr)
+	err := sp.Patch(ctx, hr)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
